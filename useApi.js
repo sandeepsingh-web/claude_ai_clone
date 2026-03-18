@@ -1,86 +1,108 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useState, useRef } from 'react';
 
-const API_URL = 'https://api.anthropic.com/v1/messages';
-const API_KEY = process.env.REACT_APP_ANTHROPIC_API_KEY || '';
+// ── Point to your NestJS backend ─────────────────────────────
+const BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:3001';
+const STREAM_URL  = `${BASE_URL}/api/chat/stream`;
+const CHAT_URL    = `${BASE_URL}/api/chat`;
 
 export default function useApi() {
   const [loading, setLoading] = useState(false);
-  const abortRef = { current: null };
+  const abortRef = useRef(null);
 
-  const sendMessage = useCallback(async ({ model, messages, onChunk, onDone, onError }) => {
+  const sendMessage = useCallback(async ({
+    model,
+    messages,
+    onChunk,
+    onDone,
+    onError,
+  }) => {
     setLoading(true);
     abortRef.current = new AbortController();
 
+    const body = JSON.stringify({ model, messages, stream: true });
+
     try {
-      const response = await fetch(API_URL, {
+      /* ── Try streaming first ───────────────────────────────── */
+      const response = await fetch(STREAM_URL, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          ...(API_KEY && { 'x-api-key': API_KEY }),
-          'anthropic-version': '2023-06-01',
-        },
+        headers: { 'Content-Type': 'application/json' },
         signal: abortRef.current.signal,
-        body: JSON.stringify({
-          model,
-          max_tokens: 2048,
-          stream: true,
-          messages: messages.map(m => ({ role: m.role, content: m.content })),
-        }),
+        body,
       });
 
       if (!response.ok) {
         const err = await response.json().catch(() => ({}));
-        throw new Error(err?.error?.message || `HTTP ${response.status}`);
+        throw new Error(err?.error || `HTTP ${response.status}`);
       }
 
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let fullText = '';
+      let buffer = '';
 
       while (true) {
         const { done, value } = await reader.read();
         if (done) break;
-        const chunk = decoder.decode(value, { stream: true });
-        const lines = chunk.split('\n').filter(l => l.startsWith('data: '));
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
         for (const line of lines) {
-          const data = line.slice(6);
-          if (data === '[DONE]') continue;
+          const trimmed = line.trim();
+          if (!trimmed || trimmed === 'data: [DONE]') continue;
+          if (!trimmed.startsWith('data: ')) continue;
+
           try {
-            const parsed = JSON.parse(data);
+            const parsed = JSON.parse(trimmed.slice(6));
+
+            // Check for server-side error forwarded in stream
+            if (parsed.error) {
+              throw new Error(parsed.error);
+            }
+
+            // Anthropic delta format
             const text = parsed?.delta?.text || '';
             if (text) {
               fullText += text;
               onChunk?.(fullText);
             }
-          } catch {}
+          } catch (parseErr) {
+            if (parseErr.message !== 'Unexpected end of JSON input') {
+              throw parseErr;
+            }
+          }
         }
       }
 
       onDone?.(fullText);
+
     } catch (err) {
-      if (err.name !== 'AbortError') {
-        // Fallback to non-streaming if streaming fails
-        try {
-          const res = await fetch(API_URL, {
-            method: 'POST',
-            headers: {
-            'Content-Type': 'application/json',
-            ...(API_KEY && { 'x-api-key': API_KEY }),
-            'anthropic-version': '2023-06-01',
-          },
-            body: JSON.stringify({
-              model,
-              max_tokens: 2048,
-              messages: messages.map(m => ({ role: m.role, content: m.content })),
-            }),
-          });
-          const data = await res.json();
-          const text = data.content?.[0]?.text || 'No response received.';
-          onChunk?.(text);
-          onDone?.(text);
-        } catch (fallbackErr) {
-          onError?.(fallbackErr.message || 'Request failed');
+      if (err.name === 'AbortError') {
+        // User stopped — not an error
+        return;
+      }
+
+      /* ── Fallback: non-streaming ───────────────────────────── */
+      try {
+        const res = await fetch(CHAT_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ model, messages }),
+        });
+
+        const data = await res.json();
+
+        if (!res.ok) {
+          throw new Error(data?.error || `HTTP ${res.status}`);
         }
+
+        const text = data.content || 'No response received.';
+        onChunk?.(text);
+        onDone?.(text);
+
+      } catch (fallbackErr) {
+        onError?.(fallbackErr.message || 'Request failed. Is the backend running?');
       }
     } finally {
       setLoading(false);
